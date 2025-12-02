@@ -5,29 +5,31 @@ import os
 import tempfile
 from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
-from flask import jsonify # Kept for potential local testing/response handling
+from flask import Flask, jsonify, request # Flask must be imported for app initialization
 
 # Load environment variables (used if running locally, ignored by Cloud Function)
 load_dotenv()
 
-# --- CONFIGURATION (Reads from Environment Variables) ---
+# --- 1. CONFIGURATION (Reads from Environment Variables) ---
+
 # WhatsApp API Configuration
 ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
 API_BASE_URL = "https://waba.mysyncro.com/APIINFO/v22.0" 
 API_URL = f"{API_BASE_URL}/{PHONE_NUMBER_ID}/messages"
 
-# Note: SHEET_ID, WORKSHEET_NAME, and GOOGLE_CREDENTIALS are NO LONGER needed 
-# by this script, as GAS sends the data directly.
+# --- 2. FLASK APP INITIALIZATION (CRITICAL FOR GUNICORN) ---
+app = Flask(__name__)
 
-# --- JSON PAYLOAD CONSTRUCTION (Remains mostly the same) ---
+# --- 3. JSON PAYLOAD CONSTRUCTION ---
 
 def build_whatsapp_payload(record):
     """
     Constructs the complex WhatsApp JSON payload using data received from the webhook.
+    
+    NOTE: Keys MUST match the keys sent by the Google Apps Script (headers).
     """
     
-    # NOTE: Keys MUST match the keys sent by the Google Apps Script (headers).
     mobile_no = str(record.get('Mobile No', '')).replace(' ', '')
     application_id = str(record.get('Application ID', ''))
     applicant_name = str(record.get('Applicant Name', ''))
@@ -67,32 +69,33 @@ def build_whatsapp_payload(record):
     }
 
 
-# --- WEBHOOK ENTRY POINT ---
+# --- 4. WEBHOOK ENTRY POINT (FLASK ROUTE) ---
 
-def process_sheet_change(request):
+@app.route('/webhook', methods=['POST'])
+def webhook_receiver():
     """
-    Receives webhook data from Google Apps Script containing the changed row data.
-    This function will be the entry point for your Cloud Function or Flask server.
+    Receives webhook data from Google Apps Script containing the changed row data,
+    and attempts to send a WhatsApp message based on that data.
     """
     
     if not ACCESS_TOKEN or not PHONE_NUMBER_ID:
         print("FATAL ERROR: WhatsApp tokens (ACCESS_TOKEN or PHONE_NUMBER_ID) are missing.")
+        # Return a 500 status to indicate server misconfiguration
         return jsonify({"status": "error", "message": "Server configuration missing API credentials."}), 500
 
     try:
         # Get the JSON data sent from the Google Apps Script
         webhook_data = request.get_json(silent=True)
         
+        # We expect the payload structure set up in the GAS script
         if not webhook_data or 'new_row_data' not in webhook_data:
             print("ERROR: Invalid webhook data received.")
             return jsonify({"status": "error", "message": "Invalid webhook data structure."}), 400
 
-        # The data we need is the single row dictionary sent by GAS
         row_data = webhook_data['new_row_data']
         row_index = webhook_data.get('row_index', 'N/A')
         
         print(f"\n--- Webhook received for Row {row_index} ---")
-        print(f"Data: {row_data}")
         
         # 1. Build Payload
         payload = build_whatsapp_payload(row_data)
@@ -107,7 +110,6 @@ def process_sheet_change(request):
         }
 
         response = requests.post(API_URL, headers=headers, json=payload)
-        
         status_code = response.status_code
 
         if status_code in [200, 201, 202]:
@@ -123,8 +125,7 @@ def process_sheet_change(request):
 
 
 if __name__ == '__main__':
-    # This block is not used for the webhook flow; it's here for local testing setup.
-    print("This script is now an HTTP trigger, run it via a web server/Cloud Function.")
-    # You would typically wrap process_sheet_change in a Flask app if running locally:
-    # app.run(debug=True, port=5000) 
-    pass
+    # Flask development server starter for local debugging
+    print("\n--- Starting Flask Development Server for Local Testing ---")
+    print("NOTE: This endpoint is /webhook")
+    app.run(debug=True, port=5000)

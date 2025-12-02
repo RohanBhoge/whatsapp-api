@@ -1,5 +1,5 @@
-Flask
 gspread
-oauth2client
 requests
-gunicorn
+oauth2client
+python-dotenv
+Flask

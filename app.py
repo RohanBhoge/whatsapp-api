@@ -3,189 +3,128 @@ import json
 import requests
 import os
 import tempfile
-from flask import Flask, jsonify, request
 from oauth2client.service_account import ServiceAccountCredentials
+from dotenv import load_dotenv
+from flask import jsonify # Kept for potential local testing/response handling
 
-# --- CONFIGURATION (Reads from Render Environment Variables) ---
-# This code is now configured to read sensitive information securely from environment variables 
-# set up on the Render dashboard.
+# Load environment variables (used if running locally, ignored by Cloud Function)
+load_dotenv()
 
-# Google Sheet Configuration
-# os.getenv() retrieves the value; the second argument is a default/fallback value.
-SPREADSHEET_NAME = os.getenv("SHEET_NAME", "My Product Inventory Sheet") 
-WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Products")
+# --- CONFIGURATION (Reads from Environment Variables) ---
+# WhatsApp API Configuration
+ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
+PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+API_BASE_URL = "https://waba.mysyncro.com/APIINFO/v22.0" 
+API_URL = f"{API_BASE_URL}/{PHONE_NUMBER_ID}/messages"
 
-# Client API Configuration
-CLIENT_API_ENDPOINT = os.getenv("CLIENT_API_ENDPOINT")
-CLIENT_API_KEY = os.getenv("CLIENT_API_KEY") 
+# Note: SHEET_ID, WORKSHEET_NAME, and GOOGLE_CREDENTIALS are NO LONGER needed 
+# by this script, as GAS sends the data directly.
 
-# Initialize Flask App
-app = Flask(__name__)
-
-# --- GOOGLE SHEETS DATA RETRIEVAL ---
-
-def get_sheet_data():
-    """
-    Authenticates using GOOGLE_CREDENTIALS env var, fetches all records, 
-    and deletes the temporary credentials file afterward.
-    """
-    
-    # 1. Get the JSON content from the secure environment variable
-    creds_json_content = os.getenv("GOOGLE_CREDENTIALS")
-    if not creds_json_content:
-        print("FATAL ERROR: GOOGLE_CREDENTIALS environment variable not set. Cannot authenticate to Google Sheets.")
-        return None
-        
-    tmp_file_name = None
-    data_records = None
-
-    try:
-        # 2. Write the JSON content to a temporary file, as gspread/ServiceAccountCredentials requires a file path
-        with tempfile.NamedTemporaryFile(mode='w', delete=False) as tmp_file:
-            tmp_file.write(creds_json_content)
-            tmp_file_name = tmp_file.name
-
-        # 3. Define the scope and authenticate
-        scope = [
-            "https://spreadsheets.google.com/feeds", 
-            'https://www.googleapis.com/auth/drive'
-        ]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(tmp_file_name, scope)
-        client = gspread.authorize(creds)
-        
-        # 4. Open the spreadsheet and worksheet
-        sheet = client.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME) 
-
-        # 5. Get all records
-        data_records = sheet.get_all_records() 
-        
-        return data_records
-
-    except gspread.exceptions.NoValidUrlKeyOrTitle:
-        print(f"ERROR: Spreadsheet '{SPREADSHEET_NAME}' not found or sheet name is wrong.")
-    except Exception as e:
-        print(f"An unexpected error occurred during Sheets access: {e}")
-    finally:
-        # 6. CRUCIAL: Clean up and delete the temporary file immediately
-        if tmp_file_name and os.path.exists(tmp_file_name):
-            os.remove(tmp_file_name)
-            
-    return None
-
-# --- JSON PAYLOAD CONSTRUCTION ---
+# --- JSON PAYLOAD CONSTRUCTION (Remains mostly the same) ---
 
 def build_whatsapp_payload(record):
     """
-    Constructs the complex WhatsApp JSON payload using data from a single sheet record.
+    Constructs the complex WhatsApp JSON payload using data received from the webhook.
     """
     
-    # 1. Map fields from the Sheet data (using the column headers as keys)
+    # NOTE: Keys MUST match the keys sent by the Google Apps Script (headers).
     mobile_no = str(record.get('Mobile No', '')).replace(' ', '')
     application_id = str(record.get('Application ID', ''))
     applicant_name = str(record.get('Applicant Name', ''))
     application_type = str(record.get('Application Type (Certificate Name)', ''))
 
-    # Basic validation
     if not mobile_no or not application_id:
-        print(f"Skipping record due to missing required fields: {record}")
+        print("Missing required fields for JSON payload.")
         return None
         
-    # 2. Construct the exact nested JSON structure required
+    certificate_text = (
+        f"{application_type}. Here is your certificate: "
+        f"https://mahainformatics.com/files/kurla/{application_id}.pdf"
+    )
+
+    to_number = "91" + mobile_no
+
     return {
-        "integrated_number": "919270334724",
-        "content_type": "template",
-        "payload": {
-            "messaging_product": "whatsapp",
-            "type": "template",
-            "template": {
-                "name": "kurlaaa",
-                "language": {
-                    "code": "en",
-                    "policy": "deterministic"
-                },
-                "namespace": "bef520bd_6b38_4231_8cd9_2f253f10a1dd",
-                "to_and_components": [
-                    {
-                        "to": [
-                            f"91{mobile_no}"
-                        ],
-                        "components": {
-                            "header_1": {
-                                "filename": application_id,
-                                "type": "document",
-                                "value": f"https://mahainformatics.com/files/andheri/{application_id}.pdf"
-                            },
-                            "body_1": {
-                                "type": "text",
-                                "value": f"Namaste🙏 {applicant_name} check your {application_type} certificate"
-                            }
-                        }
-                    }
-                ]
-            }
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to_number,
+        "type": "template",
+        "template": {
+            "name": "certsend",
+            "language": {
+                "code": "en"
+            },
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": application_id},
+                        {"type": "text", "text": certificate_text}
+                    ]
+                }
+            ]
         }
     }
 
-# --- FLASK WEBHOOK ENDPOINT ---
 
-@app.route('/sheet-update', methods=['POST'])
-def handle_webhook():
+# --- WEBHOOK ENTRY POINT ---
+
+def process_sheet_change(request):
     """
-    Receives the webhook call from Google Apps Script, processes data, and sends it.
+    Receives webhook data from Google Apps Script containing the changed row data.
+    This function will be the entry point for your Cloud Function or Flask server.
     """
-    print("\n--- Webhook received from Google Sheets ---")
     
-    # Basic validation of environment variables
-    if not CLIENT_API_ENDPOINT or not CLIENT_API_KEY:
-        print("FATAL ERROR: Client API secrets (ENDPOINT/KEY) are missing from environment variables.")
-        return jsonify({"status": "error", "message": "Server configuration error."}), 500
+    if not ACCESS_TOKEN or not PHONE_NUMBER_ID:
+        print("FATAL ERROR: WhatsApp tokens (ACCESS_TOKEN or PHONE_NUMBER_ID) are missing.")
+        return jsonify({"status": "error", "message": "Server configuration missing API credentials."}), 500
 
-    # Fetch all the latest data from the sheet
-    data_records = get_sheet_data()
-    
-    if not data_records:
-        return jsonify({"status": "error", "message": "Failed to retrieve data from Google Sheets."}), 500
+    try:
+        # Get the JSON data sent from the Google Apps Script
+        webhook_data = request.get_json(silent=True)
+        
+        if not webhook_data or 'new_row_data' not in webhook_data:
+            print("ERROR: Invalid webhook data received.")
+            return jsonify({"status": "error", "message": "Invalid webhook data structure."}), 400
 
-    success_count = 0
-    error_count = 0
-    
-    # Iterate through the sheet data and send a message for each record
-    for record in data_records:
-        payload = build_whatsapp_payload(record)
+        # The data we need is the single row dictionary sent by GAS
+        row_data = webhook_data['new_row_data']
+        row_index = webhook_data.get('row_index', 'N/A')
+        
+        print(f"\n--- Webhook received for Row {row_index} ---")
+        print(f"Data: {row_data}")
+        
+        # 1. Build Payload
+        payload = build_whatsapp_payload(row_data)
         
         if payload is None:
-            error_count += 1
-            continue
+            return jsonify({"status": "error", "message": "Failed to construct payload (missing required data)."}), 400
 
-        json_to_send = json.dumps(payload)
+        # 2. Send Message
+        headers = {
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
 
-        print(f"Attempting to send data for Mobile No: {record.get('Mobile No', 'N/A')}")
+        response = requests.post(API_URL, headers=headers, json=payload)
         
-        try:
-            headers = {
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {CLIENT_API_KEY}' 
-            }
-            
-            # This is the actual call to your client's WhatsApp API
-            response = requests.post(CLIENT_API_ENDPOINT, data=json_to_send, headers=headers)
-            
-            if response.status_code in [200, 201, 202]: 
-                print(f"SUCCESS: Data sent for {record.get('Applicant Name')}. Status: {response.status_code}")
-                success_count += 1
-            else:
-                print(f"FAILURE: Client API returned status {response.status_code} for {record.get('Applicant Name')}.")
-                error_count += 1
+        status_code = response.status_code
 
-        except requests.exceptions.RequestException as e:
-            print(f"NETWORK ERROR: Failed to connect to Client API: {e}")
-            error_count += 1
+        if status_code in [200, 201, 202]:
+            print(f"SUCCESS: Message sent for ID {row_data.get('Application ID')}. Status: {status_code}")
+            return jsonify({"status": "success", "message": f"Message sent for row {row_index}"}), 200
+        else:
+            print(f"FAILURE: WhatsApp API Error {status_code}. Response: {response.text}")
+            return jsonify({"status": "failure", "message": f"WhatsApp API failed: {status_code}"}), status_code
 
-    # 4. Return a success response to the Google Apps Script webhook
-    return jsonify({
-        "status": "processing_complete",
-        "message": "Sheet data fetched and processing initiated.",
-        "records_processed": len(data_records),
-        "records_sent_successfully": success_count,
-        "records_failed": error_count
-    }), 200
+    except Exception as e:
+        print(f"CRITICAL ERROR in webhook processing: {e}")
+        return jsonify({"status": "error", "message": f"Internal server error: {e}"}), 500
+
+
+if __name__ == '__main__':
+    # This block is not used for the webhook flow; it's here for local testing setup.
+    print("This script is now an HTTP trigger, run it via a web server/Cloud Function.")
+    # You would typically wrap process_sheet_change in a Flask app if running locally:
+    # app.run(debug=True, port=5000) 
+    pass

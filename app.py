@@ -60,7 +60,7 @@ def build_whatsapp_payload(record):
                 {
                     "type": "body",
                     "parameters": [
-                        {"type": "text", "text": application_id},
+                        {"type": "text", "text": applicant_name},
                         {"type": "text", "text": certificate_text}
                     ]
                 }
